@@ -1,6 +1,85 @@
-# LeetCode Patterns: Sorting, Templates & Snippets
+## 1. Fundamentals & Utilities
 
-Below you’ll find (1) **sorting templates**, (2) **core patterns** with example questions, ASCII “visualizations,” and “tweak points,” plus suggestions for **medium/hard** add-ons, and (3) **plug-and-play snippets** you can copy/paste.
+**Swapping**: a, b = b, a
+
+**Enumerate**: for i, x in enumerate(arr):
+
+**Range**: For i in range(1,6): print(i) -> 1,2,3,4,5
+
+**List**: list[start:end]: Gets elements from start index to end-1 index.
+
+**ZIP**
+
+- **Purpose**: Iterate two (or more) sequences in parallel, pairing up their elements.
+
+```python
+A = [1, 2, 3]
+B = ['a', 'b', 'c']
+
+for x, y in zip(A, B):
+    print(x, y)
+# Output:
+# 1 a
+# 2 b
+# 3 c
+```
+
+- **Common uses**  
+  1. Summing pairwise elements  
+     ```python
+     C = [x + y for x, y in zip([1,2,3], [4,5,6])]
+     # C == [5, 7, 9]
+     ```
+  2. Building a dict from two lists  
+     ```python
+     keys   = ['apple', 'banana', 'cherry']
+     values = [3, 2, 5]
+     d = dict(zip(keys, values))
+     # d == {'apple': 3, 'banana': 2, 'cherry': 5}
+     ```
+  3. Stopping at the shortest list  
+     ```python
+     list(zip([1,2,3,4], ['x','y']))
+     # [(1,'x'), (2,'y')]
+     ```
+- `zip(...)` → parallel iteration  
+
+
+**Unpacking (`*args`, `**kwargs`, and sequence unpacking)**
+
+```python
+def foo(a, b, *args, **kwargs):
+    print("a =", a)
+    print("b =", b)
+    print("additional positional:", args)
+    print("keyword args:", kwargs)
+
+foo(1, 2, 3, 4, x=10, y=20)
+# a = 1
+# b = 2
+# additional positional: (3, 4)
+# keyword args: {'x': 10, 'y': 20}
+```
+
+- `*args` collects extra positional arguments into a tuple.  
+- `**kwargs` collects extra keyword arguments into a dict.
+
+2. Function calls
+
+```python
+def bar(x, y, z):
+    return x + y + z
+
+nums = [10, 20, 30]
+print(bar(*nums))          # unpack list → 60
+
+params = {'x': 1, 'y': 2, 'z': 3}
+print(bar(**params))       # unpack dict → 6
+```
+ 
+- `*` in definitions/calls → pack/unpack positional args  
+- `**` in definitions/calls → pack/unpack keyword args  
+- Sequence unpacking lets you split lists/tuples flexibly.
 
 ---
 
