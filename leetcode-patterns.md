@@ -316,10 +316,15 @@ Task: maintain running sum and a hash-map of frequencies of previous prefix sums
 By maintaining a running sum of elements and using a hash map to store the frequency of each prefix sum encountered, we can efficiently count the subarrays that sum to k. 
 
 If the difference between the current prefix sum and k has been seen before, it indicates that there is a subarray that sums to k. 
+
 i.e K = 7 
+
 nums = [7, 1, 6] 
+
 Cumsum = [7, 8, 14] 
+
 Cumsum - K = [0, 1, 7]
+
 0 and 7 appeared so count = 2
 
 ```python
