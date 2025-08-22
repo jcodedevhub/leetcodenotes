@@ -306,7 +306,15 @@ When: range sum queries, count subarrays summing to k.
 **Example (560. Subarray Sum Equals K)**  
 Question:  
 ​ Given `nums` and integer `k`, return the count of continuous subarrays whose sum equals *k*.  
+Example 1:
+
+Input: nums = [1,1,1], k = 2
+Output: 2
 Task: maintain running sum and a hash-map of frequencies of previous prefix sums.
+
+By maintaining a running sum of elements and using a hash map to store the frequency of each prefix sum encountered, we can efficiently count the subarrays that sum to k. 
+
+If the difference between the current prefix sum and k has been seen before, it indicates that there is a subarray that sums to k
 
 ```python
 from collections import defaultdict
@@ -321,6 +329,29 @@ def subarraySum(nums, k):
         count += freq[curr - k]
         freq[curr] += 1
     return count
+
+#faster alternative
+def subarraySum(self, nums, k):
+        """
+        :type nums: List[int]
+        :type k: int
+        :rtype: int
+        """
+        count = 0
+        prefix_sum = 0
+        prefix_sum_count = {0: 1}  # Initialize with prefix sum 0 and count 1
+        
+        for num in nums:
+            prefix_sum += num  # Update the running prefix sum
+            if (prefix_sum - k) in prefix_sum_count:
+                count += prefix_sum_count[prefix_sum - k]  # Increment count if (prefix_sum - k) is found
+            if prefix_sum in prefix_sum_count:
+                prefix_sum_count[prefix_sum] += 1  # Update the frequency of the current prefix sum
+            else:
+                prefix_sum_count[prefix_sum] = 1  # Initialize the frequency if the prefix sum is seen for the first time
+        
+        return count        
+
 ```
 
 **Tweak**: for difference array on updates, apply +val at `l`, –val at `r+1`.
