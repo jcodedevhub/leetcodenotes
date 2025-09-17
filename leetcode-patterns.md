@@ -913,3 +913,79 @@ def findMissingAndRepeated(grid):
     return [dup, miss]
 ```
 
+### Self notes
+```python
+import numpy as np
+import yfinance as yf
+import scipy.optimize as sco
+from scipy.stats import norm
+
+def fetch_data(ticker_sym):
+    t = yf.Ticker(ticker_sym)
+    # 1-year daily price history
+    hist = t.history(period="1y")["Close"].dropna()
+    # equity volatility annualized
+    ret = hist.pct_change().dropna()
+    sigma_E = ret.std() * np.sqrt(252)
+    # market cap (equity value)
+    E = t.info["marketCap"]
+    # short- and long-term debt (default to 0 if missing)
+    SD = t.info.get("shortTermDebt", 0.0)
+    LD = t.info.get("longTermDebt",  0.0)
+    # Default point D := short-term debt + 0.5 * long-term debt
+    D = SD + 0.5 * LD
+    return E, sigma_E, D
+
+def solve_assets(E, sigma_E, D, T=1.0, r=0.02):
+    # Black-Scholes call price and equity vol equations
+    def equations(x):
+        V, sigma_V = x
+        d1 = (np.log(V/D) + (r + 0.5*sigma_V**2)*T) / (sigma_V*np.sqrt(T))
+        d2 = d1 - sigma_V*np.sqrt(T)
+        # call value
+        C = V * norm.cdf(d1) - D * np.exp(-r*T) * norm.cdf(d2)
+        # implied equity vol
+        sigma_E_calc = (V/E) * norm.cdf(d1) * sigma_V
+        return [C - E, sigma_E_calc - sigma_E]
+
+    # initial guesses: V ~ E + D, sigma_V ~ sigma_E * E/(E+D)
+    V0 = E + D
+    sigma0 = sigma_E * E/V0
+    sol = sco.root(equations, x0=[V0, sigma0], tol=1e-8)
+    if not sol.success:
+        raise RuntimeError("Root finding failed")
+    return sol.x  # V0, sigma_V
+
+def kmv_edf(ticker_sym, T=1.0, r=0.02, mu=None):
+    # 1) Fetch data
+    E, sigma_E, D = fetch_data(ticker_sym)
+    # 2) Solve for asset value & vol
+    V0, sigma_V = solve_assets(E, sigma_E, D, T=T, r=r)
+    # 3) Choose drift mu = r if not specified
+    mu = mu if mu is not None else r
+    # 4) Distance to default
+    DD = (np.log(V0/D) + (mu - 0.5*sigma_V**2)*T) / (sigma_V * np.sqrt(T))
+    # 5) Approximate EDF
+    EDF = norm.cdf(-DD)
+    return {
+        "EquityValue": E,
+        "EquityVol": sigma_E,
+        "AssetValue": V0,
+        "AssetVol": sigma_V,
+        "DefaultPoint": D,
+        "DistanceToDefault": DD,
+        "EDF": EDF
+    }
+
+if __name__ == "__main__":
+    ticker = "AAPL"  # replace with any liquid ticker
+    result = kmv_edf(ticker)
+    for k, v in result.items():
+        print(f"{k:20s}: {v:.4g}")
+```
+
+Feel free to refine:
+
+Use an empirical DD→EDF lookup table (if you have one).
+Estimate μ (asset drift) via CAPM or historical drift.
+Tweak the “default point” formula to match your firm’s capital structure.
