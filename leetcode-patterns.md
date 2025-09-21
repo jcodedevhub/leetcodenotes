@@ -919,6 +919,9 @@ import numpy as np
 import yfinance as yf
 import scipy.optimize as sco
 from scipy.stats import norm
+import pandas as pd
+from datetime import datetime, timedelta
+import pandas_datareader.data as pdr
 
 def fetch_data(ticker_sym):
     t = yf.Ticker(ticker_sym)
@@ -929,16 +932,38 @@ def fetch_data(ticker_sym):
     sigma_E = ret.std() * np.sqrt(252)
     # market cap (equity value)
     E = t.info["marketCap"]
+    
+    qbs = t.quarterly_balance_sheet
     # short- and long-term debt (default to 0 if missing)
     SD = t.info.get("shortTermDebt", 0.0)
     LD = t.info.get("longTermDebt",  0.0)
+    
+    latest_q = qbs.columns[0]
+    SD = qbs.at["Current Debt And Capital Lease Obligation", latest_q]
+    LD = qbs.at["Long Term Debt And Capital Lease Obligation",  latest_q]
+    
+    
     # Default point D := short-term debt + 0.5 * long-term debt
     D = SD + 0.5 * LD
+    if D == 0:
+        print("Default point = 0, check SD and LD")
+    
+    print(D)
+    
     return E, sigma_E, D
 
 def solve_assets(E, sigma_E, D, T=1.0, r=0.02):
     # Black-Scholes call price and equity vol equations
     def equations(x):
+        
+        #E market value (like the spot price)
+        #D face value of zero coupon debt (similar to strike price Because at debt maturity T, equity holders get max(V_T – D, 0))
+        #V = total value for firms asset (equity + debt)
+        #σ_E observed volatility (calced as annaulized vol)
+        #σ_V unknown volatility of firm's assets
+        #r risk free rate
+        #T is time to maturity
+        
         V, sigma_V = x
         d1 = (np.log(V/D) + (r + 0.5*sigma_V**2)*T) / (sigma_V*np.sqrt(T))
         d2 = d1 - sigma_V*np.sqrt(T)
@@ -946,15 +971,23 @@ def solve_assets(E, sigma_E, D, T=1.0, r=0.02):
         C = V * norm.cdf(d1) - D * np.exp(-r*T) * norm.cdf(d2)
         # implied equity vol
         sigma_E_calc = (V/E) * norm.cdf(d1) * sigma_V
+        
+        #C-E the call‐price on assets (with strike D) must equal today’s equity price
+        #sigma_E_calc - sigma_E pins the volatility of that equity to its observed vol
         return [C - E, sigma_E_calc - sigma_E]
 
     # initial guesses: V ~ E + D, sigma_V ~ sigma_E * E/(E+D)
     V0 = E + D
+    
+    #pretending N(d₁)≃1 (or roughly of order unity) rearrage where sigma_V =
     sigma0 = sigma_E * E/V0
+    
     sol = sco.root(equations, x0=[V0, sigma0], tol=1e-8)
     if not sol.success:
         raise RuntimeError("Root finding failed")
     return sol.x  # V0, sigma_V
+
+
 
 def kmv_edf(ticker_sym, T=1.0, r=0.02, mu=None):
     # 1) Fetch data
@@ -977,11 +1010,33 @@ def kmv_edf(ticker_sym, T=1.0, r=0.02, mu=None):
         "EDF": EDF
     }
 
+
+
+def get_one_year_rf_rate(past_days: int = 30):
+
+    end = datetime.utcnow().date()
+    start = end - timedelta(days=past_days)
+
+    try:
+        # Fetch the series; this returns a DataFrame with column 'DGS1'
+        df = pdr.get_data_fred('DGS1', start, end)
+        # Drop any missing values, take the last valid observation
+        latest = df['DGS1'].dropna().iloc[-1]
+        # The raw data is in percent (e.g. 4.53), so convert to decimal
+        return float(latest) / 100.0
+
+    except Exception:
+        # If anything goes wrong (network, no data, etc.) return None
+        return None
+
+    
+
 if __name__ == "__main__":
     ticker = "AAPL"  # replace with any liquid ticker
-    result = kmv_edf(ticker)
+    result = kmv_edf(ticker, r=get_one_year_rf_rate())
     for k, v in result.items():
         print(f"{k:20s}: {v:.4g}")
+
 ```
 
 Feel free to refine:
