@@ -923,6 +923,29 @@ import pandas as pd
 from datetime import datetime, timedelta
 import pandas_datareader.data as pdr
 
+
+def get_sp500_tickers(limit: int = 100) -> List[str]:
+    
+    df = pd.read_csv("nasdaqscreener.csv")
+
+    # Clean the Market Cap column — remove '$' and ',' and convert to numeric
+    df['Market Cap'] = pd.to_numeric(df['Market Cap'], errors='coerce')
+
+    # Drop rows with missing or invalid Market Cap
+    df = df.dropna(subset=['Market Cap'])
+
+    # Sort by Market Cap ascending
+    df_sorted = df.sort_values(by='Market Cap', ascending=True)
+
+    # Select the 100 smallest market caps
+    smallest_100 = df_sorted.head(100)
+
+    # Get list of stock symbols
+    smallest_100_symbols = smallest_100['Symbol'].tolist()
+
+    return smallest_100_symbols
+
+
 def fetch_data(ticker_sym):
     t = yf.Ticker(ticker_sym)
     # 1-year daily price history
@@ -1032,10 +1055,43 @@ def get_one_year_rf_rate(past_days: int = 30):
     
 
 if __name__ == "__main__":
-    ticker = "AAPL"  # replace with any liquid ticker
-    result = kmv_edf(ticker, r=get_one_year_rf_rate())
-    for k, v in result.items():
-        print(f"{k:20s}: {v:.4g}")
+    # Step 1: Get 100 smallest market-cap tickers
+    tickers = get_sp500_tickers(limit=100)
+
+    r = get_one_year_rf_rate()
+    results = []
+
+    print(f"Fetched {len(tickers)} tickers. Starting KMV EDF calculations...\n")
+
+    for ticker in tickers:
+        try:
+            res = kmv_edf(ticker, r=r)
+            res["Ticker"] = ticker
+            results.append(res)
+            print(f" {ticker}: EDF={res['EDF']:.6f}, DD={res['DistanceToDefault']:.3f}")
+        except Exception as e:
+            print(f" {ticker}: skipped due to {e}")
+            continue
+
+    # Step 2: Build DataFrame from all results
+    df_results = pd.DataFrame(results)
+
+    if df_results.empty:
+        print("\nNo valid KMV results computed.")
+    else:
+        # Step 3: Sort by EDF (ascending = safer, descending = riskier)
+        df_sorted = df_results.sort_values(by="EDF", ascending=False)
+
+        # Step 4: Select bottom 20 (highest EDF)
+        bottom_20 = df_sorted.head(20)
+
+        # Step 5: Display summary
+        print("\n--- Bottom 20 (Highest Default Risk) ---")
+        print(bottom_20[["Ticker", "EDF", "DistanceToDefault"]])
+
+        # Optional: save results to CSV
+        bottom_20.to_csv("kmv_bottom20.csv", index=False)
+        print("\nSaved bottom 20 results to 'kmv_bottom20.csv'.")
 
 ```
 
