@@ -1097,312 +1097,224 @@ if __name__ == "__main__":
 
 ### Self notes 2
 ```python
-import numpy as np
 import pandas as pd
-from sklearn.covariance import LedoitWolf
-import warnings
-warnings.filterwarnings('ignore')
+import numpy as np
+import yfinance as yf
+from datetime import timedelta
 
-def get_rolling_slices(dates, train_years=3, test_months=1):
-    """Generate rolling training/testing date ranges"""
-    dates = pd.DatetimeIndex(dates).sort_values()
-    start_date = dates.min()
-    end_date = dates.max()
+def get_stock_data(ticker_list):
+    """
+    Returns
+    -------
+    price_df        : DataFrame of absolute closing prices
+    close_pct_df    : DataFrame of daily pct‐changes of Close
+    volume_df       : DataFrame of volume scores
+    successful_tickers, failed_tickers : lists
+    """
+    price_df = pd.DataFrame()
+    close_pct_df = pd.DataFrame()
+    volume_df = pd.DataFrame()
+    successful, failed = [], []
     
-    slices = []
-    current_start = start_date
-    
-    while True:
-        train_end = current_start + pd.DateOffset(years=train_years)
-        test_end = train_end + pd.DateOffset(months=test_months)
-        
-        if test_end > end_date:
-            break
+    for tic in ticker_list:
+        try:
+            hist = yf.Ticker(tic).history(period="5y")
+            hist = hist.reset_index()[['Date','Close','Volume']]
+            hist['Date'] = pd.to_datetime(hist['Date']).dt.normalize()
+            if hist.empty:
+                failed.append(tic)
+                continue
             
-        train_mask = (dates >= current_start) & (dates < train_end)
-        test_mask = (dates >= train_end) & (dates < test_end)
-        
-        if train_mask.sum() > 252 * train_years * 0.8:  # At least 80% of trading days
-            slices.append((train_mask, test_mask))
-        
-        # Move forward by test period
-        current_start = current_start + pd.DateOffset(months=test_months)
-    
-    return slices
+            # check 5y coverage
+            now = pd.Timestamp.now().normalize()
+            if hist['Date'].min() > now - pd.DateOffset(years=5):
+                failed.append(tic); continue
+            
+            hist = hist.set_index('Date').sort_index()
+            
+            # compute volume score
+            lv = np.log1p(hist['Volume'])
+            μ = lv.ewm(span=15).mean()
+            σ = lv.ewm(span=15).std()
+            vol_score = (lv - μ) / σ
+            
+            # pct returns
+            ret = hist['Close'].pct_change()
+            
+            # align, drop NaNs
+            df = pd.concat([hist['Close'], ret, vol_score], axis=1).dropna()
+            df.columns = ['Price','Ret','VolScore']
+            
+            # insert into master DataFrames
+            price_df = price_df.merge(
+                df['Price'].rename(tic), left_index=True, right_index=True,
+                how='outer'
+            ) if not price_df.empty else df[['Price']].rename(columns={'Price':tic})
+            
+            close_pct_df = close_pct_df.merge(
+                df['Ret'].rename(tic), left_index=True, right_index=True,
+                how='outer'
+            ) if not close_pct_df.empty else df[['Ret']].rename(columns={'Ret':tic})
+            
+            volume_df = volume_df.merge(
+                df['VolScore'].rename(tic), left_index=True, right_index=True,
+                how='outer'
+            ) if not volume_df.empty else df[['VolScore']].rename(columns={'VolScore':tic})
+            
+            successful.append(tic)
+        except Exception:
+            failed.append(tic)
+    print(f"Processed {len(successful)}/{len(ticker_list)} tickers; failed: {failed}")
+    return price_df, close_pct_df, volume_df, successful, failed
 
-def shrinkage_correlation(df, shrinkage_factor=0.5):
-    """Regularized correlation matrix using Ledoit-Wolf shrinkage"""
-    if df.shape[1] < 2 or df.shape[0] < 30:
-        return df.corr()
-    
-    try:
-        lw = LedoitWolf()
-        lw.fit(df.dropna())
-        shrunk_cov = lw.covariance_
-        
-        # Convert covariance to correlation
-        std_dev = np.sqrt(np.diag(shrunk_cov))
-        corr_matrix = shrunk_cov / np.outer(std_dev, std_dev)
-        corr_matrix = np.clip(corr_matrix, -1, 1)
-        
-        return pd.DataFrame(corr_matrix, index=df.columns, columns=df.columns)
-    except:
-        # Fallback to regular correlation
-        return df.corr()
 
-def improved_eigenvector_centrality(
-    corr_matrix: pd.DataFrame,
-    threshold: float = 0.0,
-    use_pagerank: bool = True,
-    seed_ticker: str = None,
-    alpha: float = 0.85,
-    max_iter: int = 100
-):
-    """Improved centrality calculation with better error handling"""
-    
-    if seed_ticker not in corr_matrix.columns:
-        raise ValueError(f"Seed ticker {seed_ticker} not in correlation matrix")
-    
-    # Prepare adjacency matrix
+def correlations_calc(close_pct_df, volume_df, weights):
+    w_ret, w_vol = weights['returns'], weights['volume']
+    C_ret = close_pct_df.corr()
+    C_vol = volume_df.corr()
+    return C_ret * w_ret + C_vol * w_vol
+
+
+def eigenvector_centrality(corr_matrix, threshold=0.0,
+                           use_pagerank=True, seed_ticker=None,
+                           alpha=0.85, tol=1e-6, max_iter=100):
     A = corr_matrix.abs().fillna(0).values
-    np.fill_diagonal(A, 0.0)
-    
-    # Apply threshold
-    if threshold > 0:
-        A[A < threshold] = 0.0
-    
+    np.fill_diagonal(A, 0)
+    A[A < threshold] = 0
     if use_pagerank:
-        # Personalized PageRank
-        n = A.shape[0]
-        
-        # Build transition matrix
+        if seed_ticker is None:
+            raise ValueError("seed_ticker required for PageRank")
+        # build P
         row_sums = A.sum(axis=1, keepdims=True)
-        # Handle zero rows by using uniform distribution
-        zero_rows = row_sums.flatten() == 0
-        P = np.zeros_like(A)
-        
-        if not zero_rows.any():
-            P = A / row_sums
-        else:
-            for i in range(n):
-                if row_sums[i] > 0:
-                    P[i] = A[i] / row_sums[i]
-                else:
-                    P[i] = 1.0 / n  # Uniform distribution for disconnected nodes
-        
-        # Personalization vector
-        e = np.zeros(n)
-        seed_idx = corr_matrix.columns.get_loc(seed_ticker)
-        e[seed_idx] = 1.0
-        
-        # Power iteration
+        P = np.divide(A, row_sums, where=row_sums!=0)
+        n = A.shape[0]
+        e = np.zeros(n); e[corr_matrix.columns.get_loc(seed_ticker)] = 1.0
         x = e.copy()
-        for iteration in range(max_iter):
-            x_new = alpha * (P.T @ x) + (1 - alpha) * e
-            if np.linalg.norm(x_new - x, 1) < 1e-8:
+        for i in range(max_iter):
+            x_new = alpha * (P.T @ x) + (1-alpha) * e
+            if np.linalg.norm(x_new - x, 1) < tol:
                 break
             x = x_new
-        
-        centrality = x / x.max() if x.max() > 0 else x
-        
+        v = x / x.max() if x.max()!=0 else x
     else:
-        # Traditional eigenvector centrality
-        try:
-            eigvals, eigvecs = np.linalg.eig(A)
-            idx = np.argmax(eigvals.real)
-            centrality = np.abs(eigvecs[:, idx].real)
-            centrality = centrality / centrality.max() if centrality.max() > 0 else centrality
-        except:
-            # Fallback to degree centrality
-            centrality = A.sum(axis=1)
-            centrality = centrality / centrality.max() if centrality.max() > 0 else centrality
-    
-    return pd.Series(centrality, index=corr_matrix.index, name="centrality")
+        eigvals, eigvecs = np.linalg.eig(A)
+        v = np.abs(eigvecs[:, np.argmax(eigvals.real)].real)
+        v = v / v.max() if v.max()!=0 else v
+    return pd.Series(v, index=corr_matrix.index, name='centrality')
 
-def backtest_strategy(
-    close_prices_df,
-    target_ticker,
-    train_years=3,
-    test_months=1,
-    top_n=10,
-    correlation_weight=0.7,
-    centrality_weight=0.3,
-    centrality_threshold=0.1
-):
-    """
-    Backtest the recommendation strategy using rolling windows
-    """
-    # Ensure we have the target ticker
-    if target_ticker not in close_prices_df.columns:
-        return f"Target ticker {target_ticker} not in data"
-    
-    # Clean data - forward fill then drop remaining NaN
-    data_clean = close_prices_df.ffill().dropna(axis=1)
-    
-    # Calculate returns for correlation analysis
-    returns_df = data_clean.pct_change().dropna()
-    
-    if target_ticker not in returns_df.columns:
-        return f"Not enough data for target ticker {target_ticker}"
-    
-    # Generate rolling slices
-    slices = get_rolling_slices(returns_df.index, train_years, test_months)
-    
-    if not slices:
-        return "Not enough data for backtesting"
-    
-    results = []
-    
-    for i, (train_mask, test_mask) in enumerate(slices):
-        train_data = returns_df.iloc[train_mask]
-        test_data = returns_df.iloc[test_mask]
-        
-        if len(train_data) < 50 or len(test_data) < 5:
-            continue
-        
-        # Remove tickers with too many missing values in training
-        train_clean = train_data.dropna(axis=1, thresh=0.8 * len(train_data))
-        
-        if target_ticker not in train_clean.columns:
-            continue
-        
-        # Calculate correlation matrix with shrinkage
-        try:
-            corr_matrix = shrinkage_correlation(train_clean)
-        except:
-            corr_matrix = train_clean.corr()
-        
-        # Calculate centrality
-        try:
-            centrality = improved_eigenvector_centrality(
-                corr_matrix, 
-                threshold=centrality_threshold,
-                use_pagerank=True,
-                seed_ticker=target_ticker,
-                alpha=0.85
-            )
-        except Exception as e:
-            print(f"Centrality calculation failed for slice {i}: {e}")
-            continue
-        
-        # Build composite score
-        corr_with_target = corr_matrix[target_ticker].abs()
-        composite_score = (corr_with_target * correlation_weight + 
-                          centrality * centrality_weight)
-        
-        # Remove target ticker and get top recommendations
-        composite_score = composite_score.drop(target_ticker)
-        top_recommendations = composite_score.nlargest(top_n).index.tolist()
-        
-        # Calculate test performance
-        if len(top_recommendations) > 0:
-            # Average correlation in test period
-            test_corrs = []
-            for rec_ticker in top_recommendations:
-                if rec_ticker in test_data.columns:
-                    test_corr = test_data[target_ticker].corr(test_data[rec_ticker])
-                    if not np.isnan(test_corr):
-                        test_corrs.append(abs(test_corr))
-            
-            avg_test_corr = np.mean(test_corrs) if test_corrs else 0
-            
-            # Compare against simple correlation method
-            simple_recs = corr_with_target.drop(target_ticker).nlargest(top_n).index.tolist()
-            simple_test_corrs = []
-            for rec_ticker in simple_recs:
-                if rec_ticker in test_data.columns:
-                    test_corr = test_data[target_ticker].corr(test_data[rec_ticker])
-                    if not np.isnan(test_corr):
-                        simple_test_corrs.append(abs(test_corr))
-            
-            avg_simple_corr = np.mean(simple_test_corrs) if simple_test_corrs else 0
-            
-            results.append({
-                'period': i,
-                'train_start': train_data.index[0],
-                'train_end': train_data.index[-1],
-                'test_start': test_data.index[0],
-                'test_end': test_data.index[-1],
-                'composite_score': avg_test_corr,
-                'simple_correlation_score': avg_simple_corr,
-                'recommendations': top_recommendations,
-                'improvement': avg_test_corr - avg_simple_corr
-            })
-    
-    if not results:
-        return "No valid backtest results"
-    
-    results_df = pd.DataFrame(results)
-    
-    # Summary statistics
-    summary = {
-        'avg_composite_score': results_df['composite_score'].mean(),
-        'avg_simple_score': results_df['simple_correlation_score'].mean(),
-        'avg_improvement': results_df['improvement'].mean(),
-        'improvement_frequency': (results_df['improvement'] > 0).mean(),
-        'total_periods': len(results_df)
-    }
-    
-    return results_df, summary
 
-# Run the backtest
-def comprehensive_test(target_ticker, close_prices_df):
-    """Run comprehensive backtest with different parameter combinations"""
-    
-    param_combinations = [
-        {'correlation_weight': 0.5, 'centrality_weight': 0.5},
-        {'correlation_weight': 0.7, 'centrality_weight': 0.3},
-        {'correlation_weight': 0.3, 'centrality_weight': 0.7},
-        {'correlation_weight': 1.0, 'centrality_weight': 0.0},  # Baseline: pure correlation
-    ]
-    
-    all_results = {}
-    
+def build_score_table(corr_composite, centrality, target,
+                      corr_thresh=0.7,
+                      corr_weight=0.7, cent_weight=0.3,
+                      centrality_filter=False, cent_tol=0.1):
+    """
+    Returns a DataFrame of stocks with:
+      - absolute composite‐corr to target > corr_thresh
+      - optional centrality filter: |cent - cent_target| <= cent_tol
+      - final 'score' = (1-cw)*corr + cw*centrality
+    """
+    df = pd.DataFrame({
+        'corr': corr_composite[target].abs()
+    }).drop(index=target)
+    df = df[df['corr'] > corr_thresh]
+    if centrality_filter:
+        ct = centrality[target]
+        df['cent'] = centrality
+        df = df[df['cent'].between(ct-cent_tol, ct+cent_tol)]
+    else:
+        df['cent'] = centrality
+    # composite score
+    df['score'] = df['corr']*(1-corr_weight) + df['cent']*corr_weight
+    return df.sort_values('score', ascending=False)
+
+
+def rolling_backtest(price_df, ticker, param_combinations,
+                     train_years=3, test_months=1):
+    """
+    For each param combo and for each rolling month:
+      - train on prior `train_years` of data
+      - pick top3 by correlation (w/o cent) and by composite (with cent)
+      - compute short‐selling max profit over next `test_months`
+    Returns a dict of DataFrames keyed by param combo & strategy.
+    """
+    results = {}
+    dates = price_df.index.unique().sort_values()
+    start = dates.min() + pd.DateOffset(years=train_years)
+    end   = dates.max() - pd.DateOffset(months=test_months)
     for params in param_combinations:
-        print(f"Testing parameters: {params}")
-        result = backtest_strategy(
-            close_prices_df,
-            target_ticker,
-            correlation_weight=params['correlation_weight'],
-            centrality_weight=params['centrality_weight']
-        )
-        
-        if isinstance(result, tuple):
-            results_df, summary = result
-            all_results[str(params)] = {
-                'summary': summary,
-                'results': results_df
-            }
-            
-            print(f"Results for {params}:")
-            print(f"  Composite Score: {summary['avg_composite_score']:.4f}")
-            print(f"  Simple Correlation: {summary['avg_simple_score']:.4f}")
-            print(f"  Improvement: {summary['avg_improvement']:.4f}")
-            print(f"  Improvement Frequency: {summary['improvement_frequency']:.2%}")
-            print()
-    
-    return all_results
+        key = (params['correlation_weight'], params['centrality_weight'])
+        for strategy in ['corr','composite']:
+            res = []
+            cur = start
+            while cur <= end:
+                train_start = cur - pd.DateOffset(years=train_years)
+                train_end   = cur
+                test_end    = cur + pd.DateOffset(months=test_months)
+                train_slice = price_df.loc[train_start:train_end]
+                test_slice  = price_df.loc[train_end:test_end]
+                # compute correlations & cent
+                ret_train = train_slice.pct_change().dropna()
+                C = ret_train.corr()
+                cent = eigenvector_centrality(C, threshold=0.0,
+                                              use_pagerank=False)
+                if strategy=='corr':
+                    tb = pd.DataFrame({'corr':C[target].abs()}).drop(target)
+                    top3 = tb.nlargest(3,'corr').index
+                    weights = tb.loc[top3,'corr'] / tb.loc[top3,'corr'].sum()
+                else:  # composite
+                    comp = build_score_table(
+                        C, cent, target=ticker,
+                        corr_thresh=0.0,
+                        corr_weight=params['correlation_weight'],
+                        cent_weight=params['centrality_weight'],
+                        centrality_filter=False
+                    )
+                    top3 = comp.head(3).index
+                    weights = comp.loc[top3,'score'] / comp.loc[top3,'score'].sum()
+                # short‐sell profit = max((P_entry - P_min)/P_entry)
+                profs = {}
+                for tx in top3:
+                    P0 = price_df.loc[train_end, tx]
+                    Pmin = test_slice[tx].min()
+                    profs[tx] = (P0 - Pmin) / P0
+                port_profit = sum(profs[tx] * weights.loc[tx] for tx in top3)
+                res.append({
+                    'train_end': train_end,
+                    'strategy': strategy,
+                    'corr_weight':params['correlation_weight'],
+                    'cent_weight':params['centrality_weight'],
+                    'individual_profits': profs,
+                    'portfolio_profit': port_profit
+                })
+                cur += pd.DateOffset(months=1)
+            results[(key,strategy)] = pd.DataFrame(res)
+    return results
 
-# Usage example:
-# Assuming you have close_prices_df from your existing code
-target_ticker = "ABCB"
 
-# Run comprehensive backtest
-backtest_results = comprehensive_test(target_ticker, close_prices_df)
+# -------------------------------
+# Example usage
+# -------------------------------
 
-# Show current recommendations using full dataset
-current_corr = shrinkage_correlation(close_prices_df.pct_change().dropna())
-current_centrality = improved_eigenvector_centrality(
-    current_corr, 
-    seed_ticker=target_ticker
-)
+# 1) Load your ticker list
+sec_list = stock_list['Symbol'].tolist()
 
-corr_with_target = current_corr[target_ticker].abs()
-composite_score = (corr_with_target * 0.7 + current_centrality * 0.3)
-final_recommendations = composite_score.drop(target_ticker).nlargest(20)
+# 2) Fetch data
+price_df, close_pct_df, volume_df, succ, fail = get_stock_data(sec_list)
 
-print("Current Top Recommendations:")
-print(final_recommendations)
+# 3) Define parameter grid
+param_combinations = [
+    {'correlation_weight': 0.5, 'centrality_weight': 0.5},
+    {'correlation_weight': 0.7, 'centrality_weight': 0.3},
+    {'correlation_weight': 0.3, 'centrality_weight': 0.7},
+    {'correlation_weight': 0.0, 'centrality_weight': 1.0},
+]
+
+# 4) Run rolling backtest for ticker "ABCB"
+results = rolling_backtest(price_df, ticker="ABCB", param_combinations=param_combinations)
+
+# Access, e.g.:
+# results[((0.5,0.5),'corr')]  → backtest DataFrame for corr‐only strategy at (0.5,0.5)
+# results[((0.5,0.5),'composite')] → same for composite strategy
 ```
 
 Feel free to refine:
