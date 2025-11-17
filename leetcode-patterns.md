@@ -1100,71 +1100,74 @@ if __name__ == "__main__":
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from datetime import timedelta
 
 def get_stock_data(ticker_list):
     """
-    Returns
-    -------
-    price_df        : DataFrame of absolute closing prices
-    close_pct_df    : DataFrame of daily pct‐changes of Close
-    volume_df       : DataFrame of volume scores
-    successful_tickers, failed_tickers : lists
+    Fetches 5y of history for each ticker, computes daily returns and volume‐scores.
+    Returns:
+      price_df       : absolute Close prices
+      close_pct_df   : daily pct‐changes of Close
+      volume_df      : EWM‐z‐scores of log1p(volume)
+      successful, failed : lists of tickers
     """
-    price_df = pd.DataFrame()
-    close_pct_df = pd.DataFrame()
-    volume_df = pd.DataFrame()
+    now = pd.Timestamp.now().normalize()
+    five_years_ago = now - pd.DateOffset(years=5)
+
+    price_dict, ret_dict, vol_dict = {}, {}, {}
     successful, failed = [], []
-    
+
     for tic in ticker_list:
         try:
-            hist = yf.Ticker(tic).history(period="5y")
-            hist = hist.reset_index()[['Date','Close','Volume']]
-            hist['Date'] = pd.to_datetime(hist['Date']).dt.normalize()
-            if hist.empty:
+            df = yf.download(
+                tic,
+                start=(five_years_ago - pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+                end=now.strftime("%Y-%m-%d"),
+                progress=False,
+            )
+            if df.empty:
+                print(f"  → {tic}: no data")
                 failed.append(tic)
                 continue
-            
-            # check 5y coverage
-            now = pd.Timestamp.now().normalize()
-            if hist['Date'].min() > now - pd.DateOffset(years=5):
-                failed.append(tic); continue
-            
-            hist = hist.set_index('Date').sort_index()
-            
-            # compute volume score
-            lv = np.log1p(hist['Volume'])
-            μ = lv.ewm(span=15).mean()
-            σ = lv.ewm(span=15).std()
+
+            df = df.reset_index()[['Date','Close','Volume']]
+            df['Date'] = pd.to_datetime(df['Date']).dt.normalize()
+            df = df.set_index('Date').sort_index()
+
+            if df.index.min() > five_years_ago:
+                print(f"  → {tic}: earliest date {df.index.min().date()} is after {five_years_ago.date()}")
+                failed.append(tic)
+                continue
+
+            # compute returns & vol score
+            ret = df['Close'].pct_change()
+            lv  = np.log1p(df['Volume'])
+            μ   = lv.ewm(span=15).mean()
+            σ   = lv.ewm(span=15).std()
             vol_score = (lv - μ) / σ
-            
-            # pct returns
-            ret = hist['Close'].pct_change()
-            
-            # align, drop NaNs
-            df = pd.concat([hist['Close'], ret, vol_score], axis=1).dropna()
-            df.columns = ['Price','Ret','VolScore']
-            
-            # insert into master DataFrames
-            price_df = price_df.merge(
-                df['Price'].rename(tic), left_index=True, right_index=True,
-                how='outer'
-            ) if not price_df.empty else df[['Price']].rename(columns={'Price':tic})
-            
-            close_pct_df = close_pct_df.merge(
-                df['Ret'].rename(tic), left_index=True, right_index=True,
-                how='outer'
-            ) if not close_pct_df.empty else df[['Ret']].rename(columns={'Ret':tic})
-            
-            volume_df = volume_df.merge(
-                df['VolScore'].rename(tic), left_index=True, right_index=True,
-                how='outer'
-            ) if not volume_df.empty else df[['VolScore']].rename(columns={'VolScore':tic})
-            
+
+            joint = pd.concat([df['Close'], ret, vol_score], axis=1).dropna()
+            joint.columns = ['Price','Ret','VolScore']
+
+            # stash into dicts
+            price_dict[tic]     = joint['Price']
+            ret_dict[tic]       = joint['Ret']
+            vol_dict[tic]       = joint['VolScore']
+
             successful.append(tic)
-        except Exception:
+
+        except Exception as e:
+            print(f"  → {tic}: Exception: {e}")
             failed.append(tic)
-    print(f"Processed {len(successful)}/{len(ticker_list)} tickers; failed: {failed}")
+
+    # one-shot concat (no fragmentation)
+    if price_dict:
+        price_df      = pd.concat(price_dict, axis=1)
+        close_pct_df  = pd.concat(ret_dict,   axis=1)
+        volume_df     = pd.concat(vol_dict,   axis=1)
+    else:
+        price_df = close_pct_df = volume_df = pd.DataFrame()
+
+    print(f"Done. Successful: {len(successful)}, Failed: {len(failed)}")
     return price_df, close_pct_df, volume_df, successful, failed
 
 
@@ -1175,133 +1178,181 @@ def correlations_calc(close_pct_df, volume_df, weights):
     return C_ret * w_ret + C_vol * w_vol
 
 
-def eigenvector_centrality(corr_matrix, threshold=0.0,
-                           use_pagerank=True, seed_ticker=None,
-                           alpha=0.85, tol=1e-6, max_iter=100):
+def eigenvector_centrality(
+    corr_matrix: pd.DataFrame,
+    threshold: float = 0.0,
+    use_pagerank: bool = True,
+    seed_ticker: str = None,
+    alpha: float = 0.85,
+    tol: float = 1e-6,
+    max_iter: int = 100
+) -> pd.Series:
     A = corr_matrix.abs().fillna(0).values
-    np.fill_diagonal(A, 0)
-    A[A < threshold] = 0
+    np.fill_diagonal(A, 0.0)
+    A[A < threshold] = 0.0
+
     if use_pagerank:
         if seed_ticker is None:
-            raise ValueError("seed_ticker required for PageRank")
-        # build P
+            raise ValueError("seed_ticker must be provided when using PageRank")
         row_sums = A.sum(axis=1, keepdims=True)
         P = np.divide(A, row_sums, where=row_sums!=0)
         n = A.shape[0]
-        e = np.zeros(n); e[corr_matrix.columns.get_loc(seed_ticker)] = 1.0
+        e = np.zeros(n, dtype=float)
+        seed_idx = corr_matrix.columns.get_loc(seed_ticker)
+        e[seed_idx] = 1.0
         x = e.copy()
         for i in range(max_iter):
-            x_new = alpha * (P.T @ x) + (1-alpha) * e
+            x_new = alpha * (P.T @ x) + (1 - alpha) * e
             if np.linalg.norm(x_new - x, 1) < tol:
                 break
             x = x_new
         v = x / x.max() if x.max()!=0 else x
     else:
         eigvals, eigvecs = np.linalg.eig(A)
-        v = np.abs(eigvecs[:, np.argmax(eigvals.real)].real)
+        idx = np.argmax(eigvals.real)
+        v = np.abs(eigvecs[:, idx].real)
         v = v / v.max() if v.max()!=0 else v
-    return pd.Series(v, index=corr_matrix.index, name='centrality')
+
+    return pd.Series(v, index=corr_matrix.index, name="centrality")
 
 
-def build_score_table(corr_composite, centrality, target,
-                      corr_thresh=0.7,
-                      corr_weight=0.7, cent_weight=0.3,
-                      centrality_filter=False, cent_tol=0.1):
+def build_score_table(
+    corr_composite: pd.DataFrame,
+    centrality: pd.Series,
+    target: str,
+    corr_thresh: float = 0.7,
+    corr_weight: float = 0.7,
+    cent_weight: float = 0.3,
+    centrality_filter: bool = False,
+    cent_tol: float = 0.1
+) -> pd.DataFrame:
     """
-    Returns a DataFrame of stocks with:
-      - absolute composite‐corr to target > corr_thresh
-      - optional centrality filter: |cent - cent_target| <= cent_tol
-      - final 'score' = (1-cw)*corr + cw*centrality
+    Returns stocks with:
+      - |corr to target| > corr_thresh
+      - optional centrality_filter near target’s centrality ± cent_tol
+      - score = corr_weight*|corr| + cent_weight*centrality
     """
     df = pd.DataFrame({
-        'corr': corr_composite[target].abs()
+        'corr' : corr_composite[target].abs()
     }).drop(index=target)
     df = df[df['corr'] > corr_thresh]
+
+    df['cent'] = centrality
+
     if centrality_filter:
-        ct = centrality[target]
-        df['cent'] = centrality
-        df = df[df['cent'].between(ct-cent_tol, ct+cent_tol)]
-    else:
-        df['cent'] = centrality
-    # composite score
-    df['score'] = df['corr']*(1-corr_weight) + df['cent']*corr_weight
+        target_cent = centrality[target]
+        df = df[df['cent'].between(target_cent - cent_tol,
+                                   target_cent + cent_tol)]
+
+    df['score'] = corr_weight * df['corr'] + cent_weight * df['cent']
     return df.sort_values('score', ascending=False)
 
 
-def rolling_backtest(price_df, ticker, param_combinations,
-                     train_years=3, test_months=1):
+def rolling_backtest(
+    price_df: pd.DataFrame,
+    target: str,
+    param_combinations: list,
+    train_years: int = 3,
+    test_months: int = 1
+):
     """
-    For each param combo and for each rolling month:
-      - train on prior `train_years` of data
-      - pick top3 by correlation (w/o cent) and by composite (with cent)
-      - compute short‐selling max profit over next `test_months`
-    Returns a dict of DataFrames keyed by param combo & strategy.
+    For each (corr_weight, cent_weight) & rolling month:
+      - snap cur to last trading day ≤ cur
+      - train on prior train_years up to that snap‐date
+      - test on next test_months up to its snap‐date
+      - compute short‐sell max profit
     """
-    results = {}
+    if price_df.empty:
+        raise ValueError("price_df is empty—nothing to backtest on.")
+
+    # sorted unique trading dates
     dates = price_df.index.unique().sort_values()
     start = dates.min() + pd.DateOffset(years=train_years)
     end   = dates.max() - pd.DateOffset(months=test_months)
+
+    results = {}
+
     for params in param_combinations:
-        key = (params['correlation_weight'], params['centrality_weight'])
-        for strategy in ['corr','composite']:
-            res = []
+        cw, tw = params['correlation_weight'], params['centrality_weight']
+
+        for strat in ('corr','composite'):
+            rows = []
             cur = start
+
             while cur <= end:
-                train_start = cur - pd.DateOffset(years=train_years)
-                train_end   = cur
-                test_end    = cur + pd.DateOffset(months=test_months)
-                train_slice = price_df.loc[train_start:train_end]
+                # snap to last trading day on or before cur / cur+test_months
+                train_end = dates[dates.get_indexer([cur], method='pad')[0]]
+                test_end_unclipped = cur + pd.DateOffset(months=test_months)
+                test_end  = dates[dates.get_indexer([test_end_unclipped], method='pad')[0]]
+
+                # slices
+                train_slice = price_df.loc[:train_end]
+                train_slice = train_slice.loc[train_end - pd.DateOffset(years=train_years):train_end]
                 test_slice  = price_df.loc[train_end:test_end]
-                # compute correlations & cent
-                ret_train = train_slice.pct_change().dropna()
-                C = ret_train.corr()
-                cent = eigenvector_centrality(C, threshold=0.0,
+
+                # returns & correlations
+                R = train_slice.pct_change().dropna(how='all')
+                C = R.corr()
+                cent = eigenvector_centrality(C,
+                                              threshold=0.0,
                                               use_pagerank=False)
-                if strategy=='corr':
-                    tb = pd.DataFrame({'corr':C[target].abs()}).drop(target)
-                    top3 = tb.nlargest(3,'corr').index
-                    weights = tb.loc[top3,'corr'] / tb.loc[top3,'corr'].sum()
+
+                # select & weight
+                if strat == 'corr':
+                    tb = pd.Series(C[target].abs(), name='corr').drop(index=target)
+                    top3 = tb.nlargest(3).index
+                    wts  = tb.loc[top3] / tb.loc[top3].sum()
+
                 else:  # composite
                     comp = build_score_table(
-                        C, cent, target=ticker,
+                        corr_composite=C,
+                        centrality=cent,
+                        target=target,
                         corr_thresh=0.0,
-                        corr_weight=params['correlation_weight'],
-                        cent_weight=params['centrality_weight'],
+                        corr_weight=cw,
+                        cent_weight=tw,
                         centrality_filter=False
                     )
                     top3 = comp.head(3).index
-                    weights = comp.loc[top3,'score'] / comp.loc[top3,'score'].sum()
-                # short‐sell profit = max((P_entry - P_min)/P_entry)
+                    wts  = comp.loc[top3,'score'] / comp.loc[top3,'score'].sum()
+
+                # compute short‐sell profit
                 profs = {}
-                for tx in top3:
-                    P0 = price_df.loc[train_end, tx]
-                    Pmin = test_slice[tx].min()
-                    profs[tx] = (P0 - Pmin) / P0
-                port_profit = sum(profs[tx] * weights.loc[tx] for tx in top3)
-                res.append({
-                    'train_end': train_end,
-                    'strategy': strategy,
-                    'corr_weight':params['correlation_weight'],
-                    'cent_weight':params['centrality_weight'],
+                for stock in top3:
+                    P_entry = price_df.at[train_end, stock]
+                    P_min   = test_slice[stock].min()
+                    profs[stock] = (P_entry - P_min) / P_entry
+
+                port_profit = sum(profs[s]*wts[s] for s in top3)
+
+                rows.append({
+                    'train_end'        : train_end,
+                    'strategy'         : strat,
+                    'corr_weight'      : cw,
+                    'cent_weight'      : tw,
                     'individual_profits': profs,
-                    'portfolio_profit': port_profit
+                    'portfolio_profit' : port_profit
                 })
+
+                # roll forward one month
                 cur += pd.DateOffset(months=1)
-            results[(key,strategy)] = pd.DataFrame(res)
+
+            results[((cw,tw), strat)] = pd.DataFrame(rows)
+
     return results
 
 
-# -------------------------------
-# Example usage
-# -------------------------------
+# ---------------------------
+# Example of how you’d run
+# ---------------------------
 
-# 1) Load your ticker list
+# 1) load your universe
 sec_list = stock_list['Symbol'].tolist()
 
-# 2) Fetch data
+# 2) fetch & compute
 price_df, close_pct_df, volume_df, succ, fail = get_stock_data(sec_list)
 
-# 3) Define parameter grid
+# 3) composite‐weight grid
 param_combinations = [
     {'correlation_weight': 0.5, 'centrality_weight': 0.5},
     {'correlation_weight': 0.7, 'centrality_weight': 0.3},
@@ -1309,12 +1360,14 @@ param_combinations = [
     {'correlation_weight': 0.0, 'centrality_weight': 1.0},
 ]
 
-# 4) Run rolling backtest for ticker "ABCB"
-results = rolling_backtest(price_df, ticker="ABCB", param_combinations=param_combinations)
+# 4) run backtest for “ABCB”
+results = rolling_backtest(price_df, target="ABCB",
+                          param_combinations=param_combinations)
 
-# Access, e.g.:
-# results[((0.5,0.5),'corr')]  → backtest DataFrame for corr‐only strategy at (0.5,0.5)
-# results[((0.5,0.5),'composite')] → same for composite strategy
+results
+# inspect one of them:
+# results[((0.5, 0.5), 'corr')]
+# results[((0.5, 0.5), 'composite')]
 ```
 
 Feel free to refine:
