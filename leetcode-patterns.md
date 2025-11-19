@@ -1167,6 +1167,11 @@ def get_stock_data(ticker_list):
     else:
         price_df = close_pct_df = volume_df = pd.DataFrame()
 
+        
+    price_df.to_excel("close_price.xlsx")
+    close_pct_df.to_excel("price_prc.xlsx")
+    volume_df.to_excel("volume.xlsx")
+
     print(f"Done. Successful: {len(successful)}, Failed: {len(failed)}")
     return price_df, close_pct_df, volume_df, successful, failed
 
@@ -1187,7 +1192,7 @@ def eigenvector_centrality(
     tol: float = 1e-6,
     max_iter: int = 100
 ) -> pd.Series:
-    A = corr_matrix.abs().fillna(0).values
+    A = corr_matrix.abs().fillna(0).values  # ABS for centrality - measures strength of connection
     np.fill_diagonal(A, 0.0)
     A[A < threshold] = 0.0
 
@@ -1216,6 +1221,20 @@ def eigenvector_centrality(
     return pd.Series(v, index=corr_matrix.index, name="centrality")
 
 
+def get_centrality_bucket(centrality_value, centrality_series):
+    """
+    Returns the bucket (0, 1, or 2) for a given centrality value.
+    Buckets are based on tertiles of the centrality distribution.
+    """
+    tertiles = np.percentile(centrality_series.dropna(), [33.33, 66.67])
+    if centrality_value <= tertiles[0]:
+        return 0
+    elif centrality_value <= tertiles[1]:
+        return 1
+    else:
+        return 2
+
+
 def build_score_table(
     corr_composite: pd.DataFrame,
     centrality: pd.Series,
@@ -1224,25 +1243,36 @@ def build_score_table(
     corr_weight: float = 0.7,
     cent_weight: float = 0.3,
     centrality_filter: bool = False,
-    cent_tol: float = 0.1
+    use_abs_corr: bool = False
 ) -> pd.DataFrame:
     """
     Returns stocks with:
-      - |corr to target| > corr_thresh
-      - optional centrality_filter near target’s centrality ± cent_tol
-      - score = corr_weight*|corr| + cent_weight*centrality
+      - |corr to target| > corr_thresh (or corr > corr_thresh if not using abs)
+      - optional centrality_filter using bucket-based filtering
+      - score = corr_weight*corr + cent_weight*centrality
     """
-    df = pd.DataFrame({
-        'corr' : corr_composite[target].abs()
-    }).drop(index=target)
+    if use_abs_corr:
+        df = pd.DataFrame({
+            'corr' : corr_composite[target].abs()
+        }).drop(index=target)
+    else:
+        # Only positive correlations (stocks moving in same direction)
+        df = pd.DataFrame({
+            'corr' : corr_composite[target]
+        }).drop(index=target)
+    
     df = df[df['corr'] > corr_thresh]
 
     df['cent'] = centrality
 
     if centrality_filter:
         target_cent = centrality[target]
-        df = df[df['cent'].between(target_cent - cent_tol,
-                                   target_cent + cent_tol)]
+        target_bucket = get_centrality_bucket(target_cent, centrality)
+        
+        # Filter stocks in the same bucket
+        df['bucket'] = df['cent'].apply(lambda x: get_centrality_bucket(x, centrality))
+        df = df[df['bucket'] == target_bucket]
+        df = df.drop(columns=['bucket'])
 
     df['score'] = corr_weight * df['corr'] + cent_weight * df['cent']
     return df.sort_values('score', ascending=False)
@@ -1250,10 +1280,19 @@ def build_score_table(
 
 def rolling_backtest(
     price_df: pd.DataFrame,
+    close_pct_df: pd.DataFrame,
+    volume_df: pd.DataFrame,
     target: str,
     param_combinations: list,
     train_years: int = 3,
-    test_months: int = 1
+    test_months: int = 1,
+    use_abs_corr: bool = False,
+    corr_weights: dict = {'returns': 0.7, 'volume': 0.3},
+    corr_thresh: float = 0.0,
+    centrality_filter: bool = False,
+    stock_list: pd.DataFrame = None,
+    filter_sector: str = None,
+    filter_industry: str = None
 ):
     """
     For each (corr_weight, cent_weight) & rolling month:
@@ -1261,9 +1300,38 @@ def rolling_backtest(
       - train on prior train_years up to that snap‐date
       - test on next test_months up to its snap‐date
       - compute short‐sell max profit
+    
+    New parameters:
+      - corr_thresh: minimum correlation threshold for composite strategy
+      - centrality_filter: whether to filter by centrality bucket
+      - stock_list: DataFrame with Symbol, Sector, Industry columns
+      - filter_sector: if provided, only include stocks from this sector
+      - filter_industry: if provided, only include stocks from this industry
     """
     if price_df.empty:
         raise ValueError("price_df is empty—nothing to backtest on.")
+
+    # Apply sector/industry filtering if requested
+    if stock_list is not None and (filter_sector or filter_industry):
+        allowed_stocks = set(stock_list['Symbol'].tolist())
+        
+        if filter_sector:
+            allowed_stocks = allowed_stocks.intersection(
+                set(stock_list[stock_list['Sector'] == filter_sector]['Symbol'].tolist())
+            )
+        
+        if filter_industry:
+            allowed_stocks = allowed_stocks.intersection(
+                set(stock_list[stock_list['Industry'] == filter_industry]['Symbol'].tolist())
+            )
+        
+        # Filter dataframes to only include allowed stocks
+        available_stocks = [col for col in price_df.columns if col in allowed_stocks]
+        price_df = price_df[available_stocks]
+        close_pct_df = close_pct_df[available_stocks]
+        volume_df = volume_df[available_stocks]
+        
+        print(f"Filtered to {len(available_stocks)} stocks based on sector/industry criteria")
 
     # sorted unique trading dates
     dates = price_df.index.unique().sort_values()
@@ -1285,36 +1353,104 @@ def rolling_backtest(
                 test_end_unclipped = cur + pd.DateOffset(months=test_months)
                 test_end  = dates[dates.get_indexer([test_end_unclipped], method='pad')[0]]
 
-                # slices
+                # slices for price data
                 train_slice = price_df.loc[:train_end]
                 train_slice = train_slice.loc[train_end - pd.DateOffset(years=train_years):train_end]
                 test_slice  = price_df.loc[train_end:test_end]
+                
+                # slices for returns and volume data
+                returns_train = close_pct_df.loc[:train_end]
+                returns_train = returns_train.loc[train_end - pd.DateOffset(years=train_years):train_end]
+                volume_train = volume_df.loc[:train_end]
+                volume_train = volume_train.loc[train_end - pd.DateOffset(years=train_years):train_end]
 
-                # returns & correlations
+                # Calculate composite correlation using both returns and volume
+                C_composite = correlations_calc(returns_train, volume_train, corr_weights)
+
+                # Calculate returns correlation separately for the correlation-only strategy
                 R = train_slice.pct_change().dropna(how='all')
-                C = R.corr()
-                cent = eigenvector_centrality(C,
-                                              threshold=0.0,
-                                              use_pagerank=False)
+                C_returns = R.corr()
+                
+                if centrality_filter:
+                    cent = eigenvector_centrality(C_composite,
+                                                  threshold=0.0,
+                                                  use_pagerank=False)  # Use eigenvector instead
+                else:
+                    cent = eigenvector_centrality(C_composite,
+                                                  threshold=0.0,
+                                                  use_pagerank=True,
+                                                  seed_ticker=target)
+
+                # Get target's centrality for this period
+                target_centrality = cent[target] if target in cent.index else np.nan
+                
 
                 # select & weight
                 if strat == 'corr':
-                    tb = pd.Series(C[target].abs(), name='corr').drop(index=target)
-                    top3 = tb.nlargest(3).index
-                    wts  = tb.loc[top3] / tb.loc[top3].sum()
+                    if use_abs_corr:
+                        tb = pd.Series(C_returns[target].abs(), name='corr').drop(index=target)
+                    else:
+                        tb = pd.Series(C_returns[target], name='corr').drop(index=target)
+                        tb = tb[tb > 0]  # Only positive correlations
+                    
+                    if len(tb) < 1:
+                        # Not enough stocks, skip this period
+                        continue
+                    
+                    else:
+                        if len(tb) < 3: 
+                    
+                            top3 = tb.nlargest(len(tb)).index
+                            wts  = tb.loc[top3] / tb.loc[top3].sum()
+                        
+                        else:
+                            top3 = tb.nlargest(3).index
+                            wts  = tb.loc[top3] / tb.loc[top3].sum()
+                    
+                    # Store top 3 correlation values
+                    top3_corr = tb.loc[top3].to_dict()
+                    top3_cent = cent.loc[top3].to_dict()
+                    
+                    # Calculate correlation of portfolio with target in test period
+                    test_R = test_slice.pct_change().dropna(how='all')
+                    portfolio_returns = sum(test_R[s] * wts[s] for s in top3)
+                    portfolio_corr = portfolio_returns.corr(test_R[target]) if len(test_R) > 1 else np.nan
 
                 else:  # composite
                     comp = build_score_table(
-                        corr_composite=C,
+                        corr_composite=C_composite,
                         centrality=cent,
                         target=target,
-                        corr_thresh=0.0,
+                        corr_thresh=corr_thresh,
                         corr_weight=cw,
                         cent_weight=tw,
-                        centrality_filter=False
+                        centrality_filter=centrality_filter,
+                        use_abs_corr=use_abs_corr
                     )
-                    top3 = comp.head(3).index
-                    wts  = comp.loc[top3,'score'] / comp.loc[top3,'score'].sum()
+                    
+                    if len(comp) < 1:
+                        # Not enough stocks, skip this period
+                        print(f"Warning: Only {len(comp)} stocks met criteria for {strat} strategy on {train_end.date()}. Skipping period.")
+                        continue
+                    
+                    else:
+                        if len(comp) < 3:
+                            top3 = comp.head(len(comp)).index
+                            wts  = comp.loc[top3,'score'] / comp.loc[top3,'score'].sum()
+                            
+                        else:
+                            top3 = comp.head(3).index
+                            wts  = comp.loc[top3,'score'] / comp.loc[top3,'score'].sum()
+                    
+                    
+                    # Store top 3 correlation and centrality values
+                    top3_corr = comp.loc[top3, 'corr'].to_dict()
+                    top3_cent = comp.loc[top3, 'cent'].to_dict()
+                    
+                    # Calculate correlation of portfolio with target in test period
+                    test_R = test_slice.pct_change().dropna(how='all')
+                    portfolio_returns = sum(test_R[s] * wts[s] for s in top3)
+                    portfolio_corr = portfolio_returns.corr(test_R[target]) if len(test_R) > 1 else np.nan
 
                 # compute short‐sell profit
                 profs = {}
@@ -1327,9 +1463,17 @@ def rolling_backtest(
 
                 rows.append({
                     'train_end'        : train_end,
+                    'test_start'       : train_end,
+                    'test_end'         : test_end,
                     'strategy'         : strat,
                     'corr_weight'      : cw,
                     'cent_weight'      : tw,
+                    'selected_stocks'  : list(top3),
+                    'weights'          : wts.to_dict(),
+                    'top3_correlations': top3_corr,
+                    'top3_centralities': top3_cent,
+                    'target_centrality': target_centrality,
+                    'portfolio_corr_with_target': portfolio_corr,
                     'individual_profits': profs,
                     'portfolio_profit' : port_profit
                 })
@@ -1338,36 +1482,196 @@ def rolling_backtest(
                 cur += pd.DateOffset(months=1)
 
             results[((cw,tw), strat)] = pd.DataFrame(rows)
-
+    
+    all_results = []
+    for key, df in results.items():
+        (cw, tw), strat = key
+        df['param_corr_weight'] = cw
+        df['param_cent_weight'] = tw
+        df['strategy_type'] = strat
+        all_results.append(df)
+    
+    if all_results:
+        combined_results = pd.concat(all_results, ignore_index=True)
+        combined_results.to_excel("backtest_raw.xlsx", index=False)
+        print("Raw backtest results saved to backtest_raw.xlsx")
+    else:
+        print("No results to save")
+    
     return results
 
 
-# ---------------------------
-# Example of how you’d run
-# ---------------------------
+def create_comparison_report(results, param_combo, output_file='backtest_comparison.xlsx'):
+    """
+    Creates a comparison dataframe showing correlation and composite strategies side by side
+    for a specific parameter combination.
+    
+    Args:
+        results: Dictionary from rolling_backtest
+        param_combo: Tuple like (0.7, 0.3) for (corr_weight, cent_weight)
+        output_file: Excel file name to export
+    
+    Returns:
+        comparison_df: DataFrame with monthly comparison
+        summary_df: DataFrame with average statistics
+    """
+    cw, tw = param_combo
+    
+    # Get the two strategy dataframes
+    corr_df = results[((cw, tw), 'corr')].copy()
+    comp_df = results[((cw, tw), 'composite')].copy()
+    
+    # Merge on test dates
+    comparison_rows = []
+    
+    for idx in range(len(corr_df)):
+        corr_row = corr_df.iloc[idx]
+        comp_row = comp_df.iloc[idx]
+        
+        # Format date range
+        test_start = corr_row['test_start'].strftime('%Y-%m-%d')
+        test_end = corr_row['test_end'].strftime('%Y-%m-%d')
+        date_range = f"{test_start} to {test_end}"
+        
+        comparison_rows.append({
+            'Test Period': date_range,
+            'Correlation Strategy - Correlation': corr_row['portfolio_corr_with_target'],
+            'Composite Strategy - Correlation': comp_row['portfolio_corr_with_target'],
+            'Correlation Strategy - Profit (%)': corr_row['portfolio_profit'] * 100,
+            'Composite Strategy - Profit (%)': comp_row['portfolio_profit'] * 100,
+            'Correlation Strategy - Stocks': ', '.join(corr_row['selected_stocks']),
+            'Composite Strategy - Stocks': ', '.join(comp_row['selected_stocks']),
+            'Correlation Strategy - Top3 Corr': str(corr_row['top3_correlations']),
+            'Composite Strategy - Top3 Corr': str(comp_row['top3_correlations']),
+            'Composite Strategy - Top3 Cent': str(comp_row['top3_centralities']),
+            'Target Centrality': corr_row['target_centrality']
+        })
+    
+    comparison_df = pd.DataFrame(comparison_rows)
+    
+    # Create summary statistics
+    summary_data = {
+        'Metric': [
+            'Average Correlation with Target',
+            'Number of Months'
+        ],
+        'Correlation Strategy': [
+            comparison_df['Correlation Strategy - Correlation'].mean(),
+            len(comparison_df)
+        ],
+        'Composite Strategy': [
+            comparison_df['Composite Strategy - Correlation'].mean(),
+            len(comparison_df)
+        ]
+    }
+    
+    summary_df = pd.DataFrame(summary_data)
+    
+    # Export to Excel with multiple sheets
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        comparison_df.to_excel(writer, sheet_name='Monthly Results', index=False)
+        summary_df.to_excel(writer, sheet_name='Summary Statistics', index=False)
+        
+        # Format the sheets
+        workbook = writer.book
+        
+        # Format Monthly Results sheet
+        ws1 = writer.sheets['Monthly Results']
+        for column in ws1.columns:
+            max_length = 0
+            column = [cell for cell in column]
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(cell.value)
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws1.column_dimensions[column[0].column_letter].width = adjusted_width
+        
+        # Format Summary Statistics sheet
+        ws2 = writer.sheets['Summary Statistics']
+        for column in ws2.columns:
+            max_length = 0
+            column = [cell for cell in column]
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(cell.value)
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 30)
+            ws2.column_dimensions[column[0].column_letter].width = adjusted_width
+    
+    print(f"\nComparison report saved to {output_file}")
+    print("\n=== SUMMARY STATISTICS ===")
+    print(summary_df.to_string(index=False))
+    
+    return comparison_df, summary_df
 
-# 1) load your universe
-sec_list = stock_list['Symbol'].tolist()
 
-# 2) fetch & compute
-price_df, close_pct_df, volume_df, succ, fail = get_stock_data(sec_list)
+def calculate_stock_metrics(stock_list, target, close_pct_df, volume_df, corr_weights={'returns': 0.7, 'volume': 0.3}, lookback_years=3, centrality_filter: bool = False):
+    """
+    Calculate correlation and centrality metrics for all stocks relative to a target stock.
+    Merges results back into stock_list and removes rows with NaN correlations.
+    
+    Args:
+        stock_list: DataFrame with Symbol, Name, Sector, Industry columns
+        target: Target ticker symbol
+        close_pct_df: DataFrame of daily returns
+        volume_df: DataFrame of volume scores
+        corr_weights: Weights for composite correlation
+        lookback_years: Number of years to look back for calculations
+    
+    Returns:
+        DataFrame with original columns plus 'Correlation' and 'Centrality' columns
+    """
+    # Get last 3 years of data
+    end_date = close_pct_df.index.max()
+    start_date = end_date - pd.DateOffset(years=lookback_years)
+    
+    returns_slice = close_pct_df.loc[start_date:end_date]
+    volume_slice = volume_df.loc[start_date:end_date]
+    
+    # Calculate composite correlation
+    C_composite = correlations_calc(returns_slice, volume_slice, corr_weights)
+    
+    
+    if centrality_filter:
+        cent = eigenvector_centrality(C_composite,
+                                      threshold=0.0,
+                                      use_pagerank=False)  # Use eigenvector instead
+    else:
+        cent = eigenvector_centrality(C_composite,
+                                      threshold=0.0,
+                                      use_pagerank=True,
+                                      seed_ticker=target)
+        
+    # Extract correlation with target
+    target_corr = C_composite[target]
+    
+    # Create metrics dataframe
+    metrics_df = pd.DataFrame({
+        'Symbol': target_corr.index,
+        'Correlation': target_corr.values,
+        'Centrality': cent.values
+    })
+    
+    # Merge with stock_list
+    result_df = stock_list.merge(metrics_df, on='Symbol', how='left')
+    
+    # Drop rows with NaN correlations
+    result_df = result_df.dropna(subset=['Correlation'])
+    
+    # Save to Excel
+    result_df.to_excel(f'stock_metrics_{target}.xlsx', index=False)
+    print(f"Stock metrics saved to stock_metrics_{target}.xlsx")
+    print(f"Total stocks with valid correlations: {len(result_df)}")
+    
+    return result_df
 
-# 3) composite‐weight grid
-param_combinations = [
-    {'correlation_weight': 0.5, 'centrality_weight': 0.5},
-    {'correlation_weight': 0.7, 'centrality_weight': 0.3},
-    {'correlation_weight': 0.3, 'centrality_weight': 0.7},
-    {'correlation_weight': 0.0, 'centrality_weight': 1.0},
-]
 
-# 4) run backtest for “ABCB”
-results = rolling_backtest(price_df, target="ABCB",
-                          param_combinations=param_combinations)
 
-results
-# inspect one of them:
-# results[((0.5, 0.5), 'corr')]
-# results[((0.5, 0.5), 'composite')]
 ```
 
 Feel free to refine:
